@@ -7,7 +7,6 @@ from aiohttp import ClientSession, ClientTimeout
 from aiohttp_sse_client import client as sse_client
 
 from neuracore.core.auth import Auth, get_auth
-from neuracore.core.streaming.client_stream.async_runtime import AsyncRuntime
 from neuracore.core.streaming.client_stream.json_source import JSONSource
 from neuracore.core.streaming.client_stream.models import (
     HandshakeMessage,
@@ -15,6 +14,7 @@ from neuracore.core.streaming.client_stream.models import (
     RobotStreamTrack,
 )
 from neuracore.core.streaming.client_stream.stream_enabled import EnabledManager
+from neuracore.core.streaming.event_loop_utils import get_running_loop
 
 from ...const import API_URL, LIVE_DATA_ENABLED
 from .connection import PierToPierConnection
@@ -36,11 +36,10 @@ class ClientStreamingManager:
     ):
         self.robot_id = robot_id
         self.robot_instance = robot_instance
-        self.runtime = AsyncRuntime.get_instance()
         timeout = ClientTimeout(sock_read=None, total=None)
-        self.client_session = ClientSession(timeout=timeout, loop=self.runtime.loop)
+        self.client_session = ClientSession(timeout=timeout, loop=get_running_loop())
         self.auth = auth or get_auth()
-        self.streaming = EnabledManager(LIVE_DATA_ENABLED, loop=self.runtime.loop)
+        self.streaming = EnabledManager(LIVE_DATA_ENABLED, loop=get_running_loop())
         self.streaming.add_listener(EnabledManager.DISABLED, self.__close)
         self.connections: Dict[str, PierToPierConnection] = {}
         self.video_tracks_cache: Dict[str, VideoSource] = {}
@@ -48,9 +47,8 @@ class ClientStreamingManager:
         self.track_lock = asyncio.Lock()
         self.tracks: List[VideoSource] = []
         self.local_stream_id = uuid4().hex
-
-        self.signalling_stream_future = self.runtime.submit_coroutine(
-            self.connect_signalling_stream()
+        self.signalling_stream_future = asyncio.run_coroutine_threadsafe(
+            self.connect_signalling_stream(), get_running_loop()
         )
 
     def get_video_source(self, sensor_name: str, kind: str) -> VideoSource:
@@ -60,7 +58,9 @@ class ClientStreamingManager:
             return self.video_tracks_cache[sensor_key]
 
         mid = str(len(self.tracks))
-        self.runtime.submit_coroutine(self.submit_track(mid, kind, sensor_name))
+        asyncio.run_coroutine_threadsafe(
+            self.submit_track(mid, kind, sensor_name), get_running_loop()
+        )
 
         video_source = (
             DepthVideoSource(mid=mid, stream_enabled=self.streaming)
@@ -81,9 +81,11 @@ class ClientStreamingManager:
 
         mid = uuid4().hex
 
-        self.runtime.submit_coroutine(self.submit_track(mid, kind, sensor_name))
+        asyncio.run_coroutine_threadsafe(
+            self.submit_track(mid, kind, sensor_name), get_running_loop()
+        )
         source = JSONSource(
-            mid=mid, stream_enabled=self.streaming, loop=self.runtime.loop
+            mid=mid, stream_enabled=self.streaming, loop=get_running_loop()
         )
 
         self.event_source_cache[sensor_key] = source
@@ -132,7 +134,7 @@ class ClientStreamingManager:
             on_close=on_close,
             client_session=self.client_session,
             auth=self.auth,
-            loop=self.runtime.loop,
+            loop=get_running_loop(),
         )
 
         connection.setup_connection()
@@ -219,21 +221,25 @@ class ClientStreamingManager:
         if self.signalling_stream_future.running():
             self.signalling_stream_future.cancel()
 
-        self.runtime.submit_coroutine(self.close_connections())
-        self.runtime.submit_coroutine(self.client_session.close())
+        asyncio.run_coroutine_threadsafe(self.close_connections(), get_running_loop())
+        asyncio.run_coroutine_threadsafe(
+            self.client_session.close(), get_running_loop()
+        )
 
     def close(self):
         """Close all connections and streams"""
         self.streaming.disable()
         self.available_for_connections = False
-        self.runtime.submit_coroutine(self.close_connections())
+        asyncio.run_coroutine_threadsafe(self.close_connections(), get_running_loop())
 
         for track in self.video_tracks_cache.values():
             track.stop()
 
         self.connections.clear()
         self.video_tracks_cache.clear()
-        self.runtime.submit_coroutine(self.client_session.close())
+        asyncio.run_coroutine_threadsafe(
+            self.client_session.close(), get_running_loop()
+        )
 
 
 _streaming_managers: Dict[Tuple[str, int], ClientStreamingManager] = {}
