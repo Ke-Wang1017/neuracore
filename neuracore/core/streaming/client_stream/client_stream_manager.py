@@ -1,4 +1,5 @@
 import asyncio
+from concurrent.futures import Future
 from datetime import timedelta
 from typing import Dict, List, Tuple
 from uuid import uuid4
@@ -32,14 +33,16 @@ class ClientStreamingManager:
         self,
         robot_id: str,
         robot_instance: int,
+        client_session: ClientSession,
+        loop: asyncio.AbstractEventLoop,
         auth: Auth = None,
     ):
         self.robot_id = robot_id
         self.robot_instance = robot_instance
-        timeout = ClientTimeout(sock_read=None, total=None)
-        self.client_session = ClientSession(timeout=timeout, loop=get_running_loop())
+        self.loop = loop
+        self.client_session = client_session
         self.auth = auth or get_auth()
-        self.streaming = EnabledManager(LIVE_DATA_ENABLED, loop=get_running_loop())
+        self.streaming = EnabledManager(LIVE_DATA_ENABLED, loop=self.loop)
         self.streaming.add_listener(EnabledManager.DISABLED, self.__close)
         self.connections: Dict[str, PierToPierConnection] = {}
         self.video_tracks_cache: Dict[str, VideoSource] = {}
@@ -48,7 +51,7 @@ class ClientStreamingManager:
         self.tracks: List[VideoSource] = []
         self.local_stream_id = uuid4().hex
         self.signalling_stream_future = asyncio.run_coroutine_threadsafe(
-            self.connect_signalling_stream(), get_running_loop()
+            self.connect_signalling_stream(), self.loop
         )
 
     def get_video_source(self, sensor_name: str, kind: str) -> VideoSource:
@@ -59,7 +62,7 @@ class ClientStreamingManager:
 
         mid = str(len(self.tracks))
         asyncio.run_coroutine_threadsafe(
-            self.submit_track(mid, kind, sensor_name), get_running_loop()
+            self.submit_track(mid, kind, sensor_name), self.loop
         )
 
         video_source = (
@@ -82,11 +85,9 @@ class ClientStreamingManager:
         mid = uuid4().hex
 
         asyncio.run_coroutine_threadsafe(
-            self.submit_track(mid, kind, sensor_name), get_running_loop()
+            self.submit_track(mid, kind, sensor_name), self.loop
         )
-        source = JSONSource(
-            mid=mid, stream_enabled=self.streaming, loop=get_running_loop()
-        )
+        source = JSONSource(mid=mid, stream_enabled=self.streaming, loop=self.loop)
 
         self.event_source_cache[sensor_key] = source
         return source
@@ -134,7 +135,7 @@ class ClientStreamingManager:
             on_close=on_close,
             client_session=self.client_session,
             auth=self.auth,
-            loop=get_running_loop(),
+            loop=self.loop,
         )
 
         connection.setup_connection()
@@ -221,32 +222,44 @@ class ClientStreamingManager:
         if self.signalling_stream_future.running():
             self.signalling_stream_future.cancel()
 
-        asyncio.run_coroutine_threadsafe(self.close_connections(), get_running_loop())
-        asyncio.run_coroutine_threadsafe(
-            self.client_session.close(), get_running_loop()
-        )
+        asyncio.run_coroutine_threadsafe(self.close_connections(), self.loop)
+        asyncio.run_coroutine_threadsafe(self.client_session.close(), self.loop)
 
     def close(self):
         """Close all connections and streams"""
         self.streaming.disable()
         self.available_for_connections = False
-        asyncio.run_coroutine_threadsafe(self.close_connections(), get_running_loop())
+        asyncio.run_coroutine_threadsafe(self.close_connections(), self.loop)
 
         for track in self.video_tracks_cache.values():
             track.stop()
 
         self.connections.clear()
         self.video_tracks_cache.clear()
-        asyncio.run_coroutine_threadsafe(
-            self.client_session.close(), get_running_loop()
-        )
+        asyncio.run_coroutine_threadsafe(self.client_session.close(), self.loop)
 
 
-_streaming_managers: Dict[Tuple[str, int], ClientStreamingManager] = {}
+_streaming_managers: Dict[Tuple[str, int], Future[ClientStreamingManager]] = {}
+
+
+async def _create_client_streaming_manager(robot_id: str, instance: int):
+    # We want to keep the signalling connection alive for as long as possible
+    timeout = ClientTimeout(sock_read=None, total=None)
+    return ClientStreamingManager(
+        robot_id=robot_id,
+        robot_instance=instance,
+        loop=asyncio.get_event_loop(),
+        client_session=ClientSession(timeout=timeout),
+    )
 
 
 def get_robot_streaming_manager(robot_id: str, instance: int) -> ClientStreamingManager:
     key = (robot_id, instance)
     if key not in _streaming_managers:
-        _streaming_managers[key] = ClientStreamingManager(robot_id, instance)
-    return _streaming_managers[key]
+        # This needs to be run in the event loop thread
+        # otherwise we will get a 'RuntimeError: no running event loop'
+        manager = asyncio.run_coroutine_threadsafe(
+            _create_client_streaming_manager(robot_id, instance), get_running_loop()
+        )
+        _streaming_managers[key] = manager
+    return _streaming_managers[key].result()
